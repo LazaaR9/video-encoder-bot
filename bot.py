@@ -36,6 +36,11 @@ gpu_task_count = {0: 0, 1: 0}
 WAIFU2X_BIN = None
 RIFE_BIN = None
 
+# GPU availability cache
+GPU_AVAILABLE = False
+GPU_NAMES = []
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════════════
@@ -63,6 +68,61 @@ NVENC_PRESET_MAP = {
 }
 
 PRESET_LIST = ["fast", "medium", "slow", "veryslow"]
+
+
+async def check_gpu():
+    """Verify GPU is available. Sets GPU_AVAILABLE flag. Must be called at startup."""
+    global GPU_AVAILABLE, GPU_NAMES
+    try:
+        rc, stdout, _ = await run_cmd([
+            "nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"
+        ])
+        if rc == 0 and stdout.strip():
+            GPU_NAMES = [line.strip() for line in stdout.decode().strip().split("\n") if line.strip()]
+            GPU_AVAILABLE = True
+            print(f"✅ GPU detected: {GPU_NAMES}")
+        else:
+            GPU_AVAILABLE = False
+            print("❌ No GPU detected via nvidia-smi!")
+    except Exception as e:
+        GPU_AVAILABLE = False
+        print(f"❌ GPU check failed: {e}")
+
+    # Also check NVENC support
+    try:
+        rc, stdout, _ = await run_cmd(["ffmpeg", "-encoders"])
+        if rc == 0:
+            out = stdout.decode()
+            has_nvenc = "hevc_nvenc" in out or "h264_nvenc" in out
+            if has_nvenc:
+                print("✅ NVENC encoder available")
+            else:
+                print("⚠️ NVENC not found in FFmpeg — will use software encoder")
+    except Exception:
+        pass
+
+    # Check Vulkan for AI models
+    try:
+        rc, stdout, _ = await run_cmd(["vulkaninfo", "--summary"])
+        if rc == 0 and "NVIDIA" in stdout.decode():
+            print("✅ Vulkan + NVIDIA available for AI models")
+        else:
+            print("⚠️ Vulkan/NVIDIA not detected — AI models may fall back to CPU")
+    except Exception:
+        # vulkaninfo not installed, check ICD files instead
+        vulkan_ok = False
+        for d in ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"]:
+            if os.path.isdir(d):
+                for f in os.listdir(d):
+                    if "nvidia" in f.lower():
+                        vulkan_ok = True
+                        break
+        if vulkan_ok:
+            print("✅ NVIDIA Vulkan ICD found")
+        else:
+            print("⚠️ No NVIDIA Vulkan ICD — AI models may use CPU")
+
+    return GPU_AVAILABLE
 
 
 async def get_best_gpu():
@@ -398,25 +458,22 @@ async def interpolate_rife(in_dir, out_dir, gpu_id, multiplier=2, model="rife-v4
 
 
 async def encode_frames(frames_dir, output_path, src_path, fps, settings, gpu_id, msg=None):
-    """Encode processed frames back to video with NVENC. Uses -progress pipe:1 for detailed stats."""
-    use_gpu = settings.get("gpu_enabled", True)
+    """Encode processed frames back to video with NVENC (GPU-only). Uses -progress pipe:1 for detailed stats."""
+    if not GPU_AVAILABLE:
+        raise RuntimeError("No GPU available! This bot requires an NVIDIA GPU with NVENC support.")
 
     cmd = ["ffmpeg", "-y",
            "-framerate", str(fps),
            "-i", os.path.join(frames_dir, "frame_%08d.png"),
            "-i", src_path,
-           "-map", "0:v:0", "-map", "1:a?"]
+           "-map", "0:v:0", "-map", "1:a?",
+           "-hwaccel", "cuda", "-hwaccel_device", str(gpu_id)]
 
-    if use_gpu:
-        cmd.extend(["-c:v", "hevc_nvenc", "-gpu", str(gpu_id)])
-        cmd.extend(["-rc", "vbr", "-cq", str(settings["crf"])])
-        cmd.extend(["-preset", NVENC_PRESET_MAP.get(settings["preset"], "p4")])
-        cmd.extend(["-maxrate", "15M", "-bufsize", "15M"])
-        cmd.extend(["-vf", "format=nv12"])
-    else:
-        cmd.extend(["-c:v", "libx265", "-crf", str(settings["crf"]),
-                    "-preset", settings["preset"],
-                    "-x265-params", "log-level=error"])
+    cmd.extend(["-c:v", "hevc_nvenc", "-gpu", str(gpu_id)])
+    cmd.extend(["-rc", "vbr", "-cq", str(settings["crf"])])
+    cmd.extend(["-preset", NVENC_PRESET_MAP.get(settings["preset"], "p4")])
+    cmd.extend(["-maxrate", "15M", "-bufsize", "15M"])
+    cmd.extend(["-vf", "format=nv12"])
 
     cmd.extend(["-c:a", "copy", "-movflags", "+faststart"])
     cmd.extend(["-progress", "pipe:1"])  # Structured progress output
@@ -691,7 +748,6 @@ async def upload_to_gdrive(file_path, file_name, msg):
 def get_main_keyboard(s):
     up = "ON" if s.get("ai_upscale") else "OFF"
     rife = "ON" if s.get("ai_interpolate") else "OFF"
-    gpu = "ON" if s.get("gpu_enabled") else "OFF"
     denoise = s.get("denoise", 1)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🎨 Upscale: {up}", callback_data="toggle_upscale"),
@@ -700,7 +756,6 @@ def get_main_keyboard(s):
          InlineKeyboardButton(f"📊 CRF: {s['crf']}", callback_data="crf")],
         [InlineKeyboardButton(f"⚡ Preset: {s['preset']}", callback_data="preset"),
          InlineKeyboardButton(f"📐 Res: {s['resolution']}", callback_data="resolution")],
-        [InlineKeyboardButton(f"🚀 GPU: {gpu}", callback_data="toggle_gpu")],
         [InlineKeyboardButton("✅ Start Encoding", callback_data="encode")],
     ])
 
@@ -778,7 +833,7 @@ async def cmd_start(client, message):
         "🖥️ **NVENC** — H.265 GPU encoding\n\n"
         "**Commands:**\n"
         "/start · /help · /encode · /settings\n"
-        "/status · /models · /cancel · /about\n\n"
+        "/status · /gpu · /models · /cancel · /about\n\n"
         "📹 **Send an anime video to start!**"
     )
     if thumb:
@@ -850,7 +905,7 @@ async def cmd_settings(client, message):
             f"📊 CRF: **{s['crf']}**\n"
             f"⚡ Preset: **{s['preset']}**\n"
             f"📐 Res: **{s['resolution']}**\n"
-            f"🚀 GPU: **{'ON' if s['gpu_enabled'] else 'OFF'}**\n"
+            f"🖥️ GPU: **Always ON (GPU-only mode)**\n"
             f"📁 File: **{s.get('file_name', 'None')}**"
         )
     else:
@@ -862,7 +917,7 @@ async def cmd_settings(client, message):
             "📊 CRF: 23\n"
             "⚡ Preset: medium\n"
             "📐 Res: original\n"
-            "🚀 GPU: ON\n\n"
+            "🖥️ GPU: Always ON\n\n"
             "Send a video to customize."
         )
 
@@ -875,19 +930,93 @@ async def cmd_status(client, message):
         ffver = stdout.decode().split('\n')[0] if stdout else "?"
     except Exception:
         ffver = "❌ not found"
-    gpu_info = "?"
+
+    gpu_lines = []
     try:
-        rc, stdout, _ = await run_cmd(["nvidia-smi", "--query-gpu=name,memory.free", "--format=csv,noheader"])
+        rc, stdout, _ = await run_cmd([
+            "nvidia-smi", "--query-gpu=name,memory.total,memory.free,utilization.gpu,temperature.gpu",
+            "--format=csv,noheader"
+        ])
         if rc == 0:
-            gpu_info = stdout.decode().strip().split("\n")[0]
+            for i, line in enumerate(stdout.decode().strip().split("\n")):
+                if line.strip():
+                    gpu_lines.append(f"  GPU {i}: {line.strip()}")
     except Exception:
         pass
+
+    gpu_text = "\n".join(gpu_lines) if gpu_lines else "❌ No GPU detected!"
+
+    # Check NVENC
+    nvenc_ok = False
+    try:
+        rc, stdout, _ = await run_cmd(["ffmpeg", "-encoders"])
+        if rc == 0 and "hevc_nvenc" in stdout.decode():
+            nvenc_ok = True
+    except Exception:
+        pass
+
+    # Check Vulkan
+    vulkan_ok = False
+    for d in ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"]:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if "nvidia" in f.lower():
+                    vulkan_ok = True
+
     await message.reply_text(
         f"📊 **Status**\n\n"
         f"🟢 Online | ⏱️ {get_uptime()}\n"
-        f"🎬 Active: **{len(active_tasks)}**\n"
-        f"🔧 FFmpeg: `{ffver}`\n"
-        f"🖥️ GPU: `{gpu_info}`"
+        f"🎬 Active: **{len(active_tasks)}**\n\n"
+        f"🖥️ **GPU:**\n{gpu_text}\n\n"
+        f"{'✅' if nvenc_ok else '❌'} NVENC (H.265 HW encoder)\n"
+        f"{'✅' if vulkan_ok else '❌'} Vulkan (AI model GPU accel)\n"
+        f"🔧 FFmpeg: `{ffver}`"
+    )
+
+
+@app.on_message(filters.command("gpu"))
+async def cmd_gpu(client, message):
+    """Detailed GPU info and AI model GPU status."""
+    await react_to_message(client, message.chat.id, message.id)
+
+    # nvidia-smi detailed
+    gpu_info = "❌ No GPU detected"
+    try:
+        rc, stdout, _ = await run_cmd(["nvidia-smi"])
+        if rc == 0:
+            gpu_info = f"```\n{stdout.decode()[:1500]}\n```"
+    except Exception:
+        pass
+
+    # Test waifu2x GPU
+    w_gpu = "❌ Not installed"
+    if check_waifu2x():
+        try:
+            rc, stdout, stderr = await run_cmd([
+                WAIFU2X_BIN, "-i", "/dev/null", "-o", "/dev/null", "-g", "0"
+            ], timeout=5)
+            w_gpu = "✅ GPU ready" if rc == 0 or "vk" in stderr.decode().lower() else "⚠️ May use CPU"
+        except Exception:
+            w_gpu = "✅ Installed (GPU unknown)"
+
+    # Test RIFE GPU
+    r_gpu = "❌ Not installed"
+    if check_rife():
+        try:
+            rc, stdout, stderr = await run_cmd([
+                RIFE_BIN, "-i", "/dev/null", "-o", "/dev/null", "-g", "0"
+            ], timeout=5)
+            r_gpu = "✅ GPU ready" if rc == 0 or "vk" in stderr.decode().lower() else "⚠️ May use CPU"
+        except Exception:
+            r_gpu = "✅ Installed (GPU unknown)"
+
+    await message.reply_text(
+        f"🖥️ **GPU Status**\n\n"
+        f"{gpu_info}\n\n"
+        f"**AI Models:**\n"
+        f"🎨 waifu2x: {w_gpu}\n"
+        f"🎞️ RIFE: {r_gpu}\n\n"
+        f"**Encoding:** Always NVENC (GPU-only mode)"
     )
 
 
@@ -949,7 +1078,6 @@ async def video_handler(client, message):
     user_settings[uid] = {
         "file_id": fid, "file_name": fname, "file_size": fsize,
         "crf": 23, "preset": "medium", "resolution": "original",
-        "gpu_enabled": True,
         "ai_upscale": True, "denoise": 1,
         "ai_interpolate": False, "rife_mult": 2, "rife_model": "rife-v4",
         "awaiting_crf": False, "source_w": 0, "source_h": 0,
@@ -1062,12 +1190,6 @@ async def callback_handler(client, cb: CallbackQuery):
         res = data.replace("set_res_", "")
         s["resolution"] = res
         await cb.answer(f"Res: {res}")
-        await safe_edit_text(msg, "⚙️ Settings:", reply_markup=get_main_keyboard(s))
-
-    # ── GPU ────────────────────────────────────────────────────────────
-    elif data == "toggle_gpu":
-        s["gpu_enabled"] = not s["gpu_enabled"]
-        await cb.answer(f"GPU: {'ON' if s['gpu_enabled'] else 'OFF'}")
         await safe_edit_text(msg, "⚙️ Settings:", reply_markup=get_main_keyboard(s))
 
     # ── Encode ─────────────────────────────────────────────────────────
@@ -1336,19 +1458,31 @@ async def cleanup():
 async def main():
     async with app:
         asyncio.create_task(cleanup())
+
+        # GPU check at startup
+        gpu_ok = await check_gpu()
+        gpu_name = GPU_NAMES[0] if GPU_NAMES else "Not detected"
+
+        startup_msg = (
+            f"✅ **Anime Encoder Bot Started!**\n\n"
+            f"🎨 waifu2x | 🎞️ RIFE | 🖥️ NVENC\n"
+            f"🖥️ GPU: **{gpu_name}** {'✅' if gpu_ok else '❌ NO GPU!'}\n"
+            f"{'⚠️ Bot requires GPU for encoding!' if not gpu_ok else 'Ready to encode anime.'}"
+        )
+
         if LOG_CHANNEL:
             try:
-                await app.send_message(LOG_CHANNEL,
-                    "✅ **Anime Encoder Bot Started!**\n\n"
-                    "🎨 waifu2x | 🎞️ RIFE | 🖥️ NVENC\n"
-                    "Ready to encode anime.")
+                await app.send_message(LOG_CHANNEL, startup_msg)
             except Exception:
                 pass
         for aid in ADMINS:
             try:
-                await app.send_message(aid, "✅ **Anime Encoder Bot is online!**")
+                await app.send_message(aid, startup_msg)
             except Exception:
                 pass
+
+        if not gpu_ok:
+            print("⚠️ WARNING: No GPU detected! Encoding will fail.")
         print("Anime Encoder Bot running...")
         await asyncio.Event().wait()
 
