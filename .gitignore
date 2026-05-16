@@ -1,0 +1,9 @@
+.env
+*.session
+*.session-journal
+venv/
+downloads/
+encoded/
+__pycache__/
+*.pyc
+logs.txt
