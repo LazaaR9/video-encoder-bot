@@ -262,61 +262,143 @@ async def extract_frames(input_path, frames_dir, msg=None):
     if msg:
         await safe_edit_text(msg, "✂️ **Extracting frames...**")
     os.makedirs(frames_dir, exist_ok=True)
-    rc, _, stderr = await run_cmd([
+
+    # Get total frames for progress
+    total = 0
+    try:
+        val = await ffprobe(["-select_streams", "v:0", "-show_entries", "stream=nb_frames",
+                             "-of", "default=noprint_wrappers=1:nokey=1"], input_path)
+        if val and val != "N/A":
+            total = int(val)
+    except Exception:
+        pass
+
+    proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-i", input_path, "-vsync", "0",
-        os.path.join(frames_dir, "frame_%08d.png")
-    ])
-    if rc != 0:
-        print(f"Extract failed: {stderr.decode()[-200:]}")
-        return 0
-    return len([f for f in os.listdir(frames_dir) if f.endswith(".png")])
+        os.path.join(frames_dir, "frame_%08d.png"),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+
+    # Monitor extraction progress
+    start = time.time()
+    last_update = 0
+    while proc.returncode is None:
+        await asyncio.sleep(1)
+        done = len([f for f in os.listdir(frames_dir) if f.endswith(".png")])
+        now = time.time()
+        if msg and now - last_update >= 3 and total > 0:
+            last_update = now
+            pct = min(int(done * 100 / total), 99)
+            elapsed = now - start
+            fps = done / elapsed if elapsed > 0 else 0
+            bar = make_progress_bar(pct)
+            try:
+                await msg.edit_text(
+                    f"✂️ **Extracting frames...** [{bar}] **{pct}%**\n\n"
+                    f"🖼️ Frames: **{done}/{total}**\n"
+                    f"⚡ Speed: **{fps:.1f}** frames/sec\n"
+                    f"⏱️ {int(elapsed)}s elapsed"
+                )
+            except Exception:
+                pass
+
+    await proc.wait()
+    count = len([f for f in os.listdir(frames_dir) if f.endswith(".png")])
+    return count
 
 
-async def upscale_waifu2x(in_dir, out_dir, gpu_id, scale=2, noise=1, msg=None):
+async def upscale_waifu2x(in_dir, out_dir, gpu_id, scale=2, noise=1, msg=None, total_frames=0):
     if not check_waifu2x():
         return False
     os.makedirs(out_dir, exist_ok=True)
-    if msg:
-        await safe_edit_text(
-            msg,
-            f"🎨 **waifu2x Upscaling...**\n"
-            f"🖥️ T4 #{gpu_id} | {scale}x | Denoise: {noise}"
-        )
-    rc, _, stderr = await run_cmd([
+
+    # Start waifu2x process (streams to stderr, we poll output dir for progress)
+    env = get_vulkan_env()
+    proc = await asyncio.create_subprocess_exec(
         WAIFU2X_BIN, "-i", in_dir, "-o", out_dir,
-        "-s", str(scale), "-g", str(gpu_id), "-n", str(noise), "-f", "png"
-    ], env=get_vulkan_env(), timeout=3600)
-    if rc != 0:
-        print(f"waifu2x failed: {stderr.decode()[-200:]}")
-        return False
-    return len([f for f in os.listdir(out_dir) if f.endswith(".png")]) > 0
+        "-s", str(scale), "-g", str(gpu_id), "-n", str(noise), "-f", "png",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
+    )
+
+    # Monitor progress by counting output files
+    start = time.time()
+    last_update = 0
+    while proc.returncode is None:
+        await asyncio.sleep(2)
+        done = len([f for f in os.listdir(out_dir) if f.endswith(".png")])
+        now = time.time()
+        if msg and now - last_update >= 4 and total_frames > 0:
+            last_update = now
+            pct = min(int(done * 100 / total_frames), 99)
+            elapsed = now - start
+            fps = done / elapsed if elapsed > 0 else 0
+            remaining = (total_frames - done) / fps if fps > 0 else 0
+            bar = make_progress_bar(pct)
+            try:
+                await msg.edit_text(
+                    f"🎨 **waifu2x Upscaling...** [{bar}] **{pct}%**\n\n"
+                    f"🖼️ Frames: **{done}/{total_frames}**\n"
+                    f"⚡ Speed: **{fps:.1f}** frames/sec\n"
+                    f"🖥️ T4 #{gpu_id} | {scale}x | Denoise: {noise}\n"
+                    f"⏱️ {int(elapsed//60)}m {int(elapsed%60)}s | ETA {int(remaining//60)}m {int(remaining%60)}s"
+                )
+            except Exception:
+                pass
+
+    await proc.wait()
+    ok = len([f for f in os.listdir(out_dir) if f.endswith(".png")]) > 0
+    if not ok:
+        print(f"waifu2x failed: {proc.stderr}")
+    return ok
 
 
-async def interpolate_rife(in_dir, out_dir, gpu_id, multiplier=2, model="rife-v4", msg=None):
+async def interpolate_rife(in_dir, out_dir, gpu_id, multiplier=2, model="rife-v4", msg=None, total_frames=0):
     if not check_rife():
         return False
     os.makedirs(out_dir, exist_ok=True)
-    if msg:
-        await safe_edit_text(
-            msg,
-            f"🎞️ **RIFE Frame Interpolation...**\n"
-            f"🖥️ T4 #{gpu_id} | {multiplier}x | Model: {model}"
-        )
-    rc, _, stderr = await run_cmd([
+
+    env = get_vulkan_env()
+    proc = await asyncio.create_subprocess_exec(
         RIFE_BIN, "-i", in_dir, "-o", out_dir,
-        "-g", str(gpu_id), "-m", model, "-n", str(multiplier)
-    ], env=get_vulkan_env(), timeout=3600)
-    if rc != 0:
-        print(f"RIFE failed: {stderr.decode()[-200:]}")
-        return False
-    return len([f for f in os.listdir(out_dir) if f.endswith(".png")]) > 0
+        "-g", str(gpu_id), "-m", model, "-n", str(multiplier),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
+    )
+
+    # RIFE output = total_frames * multiplier
+    expected = total_frames * multiplier
+    start = time.time()
+    last_update = 0
+    while proc.returncode is None:
+        await asyncio.sleep(2)
+        done = len([f for f in os.listdir(out_dir) if f.endswith(".png")])
+        now = time.time()
+        if msg and now - last_update >= 4 and expected > 0:
+            last_update = now
+            pct = min(int(done * 100 / expected), 99)
+            elapsed = now - start
+            fps = done / elapsed if elapsed > 0 else 0
+            remaining = (expected - done) / fps if fps > 0 else 0
+            bar = make_progress_bar(pct)
+            try:
+                await msg.edit_text(
+                    f"🎞️ **RIFE Interpolation...** [{bar}] **{pct}%**\n\n"
+                    f"🖼️ Frames: **{done}/{expected}** ({total_frames} → {expected})\n"
+                    f"⚡ Speed: **{fps:.1f}** frames/sec\n"
+                    f"🖥️ T4 #{gpu_id} | {multiplier}x | {model}\n"
+                    f"⏱️ {int(elapsed//60)}m {int(elapsed%60)}s | ETA {int(remaining//60)}m {int(remaining%60)}s"
+                )
+            except Exception:
+                pass
+
+    await proc.wait()
+    ok = len([f for f in os.listdir(out_dir) if f.endswith(".png")]) > 0
+    if not ok:
+        print(f"RIFE failed: {proc.stderr}")
+    return ok
 
 
 async def encode_frames(frames_dir, output_path, src_path, fps, settings, gpu_id, msg=None):
-    """Encode processed frames back to video with NVENC."""
-    if msg:
-        await safe_edit_text(msg, f"🎬 **Encoding H.265 (NVENC)...**\n🖥️ T4 #{gpu_id}")
-
+    """Encode processed frames back to video with NVENC. Uses -progress pipe:1 for detailed stats."""
     use_gpu = settings.get("gpu_enabled", True)
 
     cmd = ["ffmpeg", "-y",
@@ -330,19 +412,125 @@ async def encode_frames(frames_dir, output_path, src_path, fps, settings, gpu_id
         cmd.extend(["-rc", "vbr", "-cq", str(settings["crf"])])
         cmd.extend(["-preset", NVENC_PRESET_MAP.get(settings["preset"], "p4")])
         cmd.extend(["-maxrate", "15M", "-bufsize", "15M"])
-        # Anime-friendly: keep 10-bit if source has it, else nv12
         cmd.extend(["-vf", "format=nv12"])
     else:
         cmd.extend(["-c:v", "libx265", "-crf", str(settings["crf"]),
                     "-preset", settings["preset"],
                     "-x265-params", "log-level=error"])
 
-    cmd.extend(["-c:a", "copy", "-movflags", "+faststart", output_path])
+    cmd.extend(["-c:a", "copy", "-movflags", "+faststart"])
+    cmd.extend(["-progress", "pipe:1"])  # Structured progress output
+    cmd.append(output_path)
 
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     return process
+
+
+def _parse_progress_line(line):
+    """Parse a key=value line from FFmpeg -progress output."""
+    line = line.strip()
+    if "=" in line:
+        k, _, v = line.partition("=")
+        return k.strip(), v.strip()
+    return None, None
+
+
+async def _monitor_encode_progress(process, msg, total_frames, duration, gpu_id, ai_info, settings):
+    """Read FFmpeg progress output and update the message with detailed stats."""
+    start = time.time()
+    last_update = 0
+    current_frame = 0
+    current_fps = 0
+    current_bitrate = ""
+    current_size = 0
+    current_speed = ""
+    current_time_us = 0  # microseconds
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            # Also check stderr for any output
+            break
+        txt = line.decode("utf-8", errors="ignore")
+
+        key, val = _parse_progress_line(txt)
+        if key == "frame":
+            try:
+                current_frame = int(val)
+            except ValueError:
+                pass
+        elif key == "fps":
+            try:
+                current_fps = float(val)
+            except ValueError:
+                pass
+        elif key == "bitrate":
+            current_bitrate = val
+        elif key == "total_size":
+            try:
+                current_size = int(val)
+            except ValueError:
+                pass
+        elif key == "speed":
+            current_speed = val
+        elif key == "out_time_us":
+            try:
+                current_time_us = int(val)
+            except ValueError:
+                pass
+        elif key == "progress" and val == "end":
+            # Final update
+            break
+
+        now = time.time()
+        if now - last_update >= 4:
+            last_update = now
+            elapsed = now - start
+
+            # Calculate percentage from frame count or time
+            pct = 0
+            if total_frames > 0:
+                pct = min(int(current_frame * 100 / total_frames), 99)
+            elif duration > 0 and current_time_us > 0:
+                pct = min(int((current_time_us / 1_000_000) / duration * 100), 99)
+
+            bar = make_progress_bar(pct)
+            size_mb = current_size / (1024 * 1024)
+
+            # Build AI info line
+            ai_line = ""
+            if ai_info.get("upscaled"):
+                ai_line += f"🎨 Upscale: **waifu2x {ai_info['scale']}x**\n"
+            if ai_info.get("interpolated"):
+                ai_line += f"🎞️ RIFE: **{settings.get('rife_mult', 2)}x** ({ai_info['fps_in']}→{ai_info['fps_out']} fps)\n"
+
+            # ETA from speed
+            eta_str = "..."
+            if current_fps > 0 and total_frames > 0:
+                remaining = (total_frames - current_frame) / current_fps
+                eta_str = f"{int(remaining//60)}m {int(remaining%60)}s"
+            elif pct > 0:
+                eta_s = int((elapsed / pct) * (100 - pct))
+                eta_str = f"{eta_s//60}m {eta_s%60}s"
+
+            try:
+                await msg.edit_text(
+                    f"🔄 **Encoding H.265 (NVENC)...**\n\n"
+                    f"{ai_line}"
+                    f"🖥️ T4 #{gpu_id}\n\n"
+                    f"[{bar}] **{pct}%**\n\n"
+                    f"🖼️ Frame: **{current_frame}**/{total_frames or '?'}\n"
+                    f"🎞️ FPS: **{current_fps:.1f}** | Speed: **{current_speed or '?'}**\n"
+                    f"📊 Bitrate: **{current_bitrate or '?'}**\n"
+                    f"📦 Size: **{size_mb:.1f} MB**\n"
+                    f"⏱️ {int(elapsed//60)}m {int(elapsed%60)}s | ETA **{eta_str}**"
+                )
+            except Exception:
+                pass
+
+    return current_frame, current_size
 
 
 async def anime_encode_pipeline(input_path, output_path, settings, gpu_id, msg=None):
@@ -364,11 +552,13 @@ async def anime_encode_pipeline(input_path, output_path, settings, gpu_id, msg=N
         src_fps = await get_video_fps(input_path)
         info["fps_in"] = round(src_fps, 2)
         src_w, src_h = await get_video_resolution(input_path)
+        duration = await get_video_duration(input_path)
 
         # 1. Extract
         count = await extract_frames(input_path, frames_dir, msg)
         if count == 0:
             return False, info
+        total_frames = count
 
         current = frames_dir
 
@@ -384,7 +574,10 @@ async def anime_encode_pipeline(input_path, output_path, settings, gpu_id, msg=N
                     scale = 2
 
             noise = settings.get("denoise", 1)
-            ok = await upscale_waifu2x(current, upscaled_dir, gpu_id, scale=scale, noise=noise, msg=msg)
+            ok = await upscale_waifu2x(
+                current, upscaled_dir, gpu_id,
+                scale=scale, noise=noise, msg=msg, total_frames=total_frames
+            )
             if ok:
                 current = upscaled_dir
                 info["upscaled"] = True
@@ -397,11 +590,15 @@ async def anime_encode_pipeline(input_path, output_path, settings, gpu_id, msg=N
         if settings.get("ai_interpolate"):
             mult = settings.get("rife_mult", 2)
             model = settings.get("rife_model", "rife-v4")
-            ok = await interpolate_rife(current, interpolated_dir, gpu_id, multiplier=mult, model=model, msg=msg)
+            ok = await interpolate_rife(
+                current, interpolated_dir, gpu_id,
+                multiplier=mult, model=model, msg=msg, total_frames=total_frames
+            )
             if ok:
                 current = interpolated_dir
                 info["interpolated"] = True
                 info["fps_out"] = round(src_fps * mult, 2)
+                total_frames = total_frames * mult  # update for encode progress
             else:
                 info["fps_out"] = round(src_fps, 2)
                 if msg:
@@ -409,48 +606,18 @@ async def anime_encode_pipeline(input_path, output_path, settings, gpu_id, msg=N
         else:
             info["fps_out"] = round(src_fps, 2)
 
-        # 4. Encode
+        # 4. Encode with detailed progress
         out_fps = info["fps_out"]
         process = await encode_frames(current, output_path, input_path, out_fps, settings, gpu_id, msg)
-
-        duration = await get_video_duration(input_path)
         active_tasks[settings.get("_uid", 0)] = process
 
-        last_pct = -1
-        last_time = 0
-        start = time.time()
+        if msg:
+            await safe_edit_text(msg, f"🎬 **Starting encode...** ({total_frames} frames)")
 
-        while True:
-            line = await process.stderr.readline()
-            if not line:
-                break
-            txt = line.decode("utf-8", errors="ignore")
-            if duration > 0:
-                pct = parse_ffmpeg_progress(txt, duration)
-                if pct is not None and pct != last_pct:
-                    now = time.time()
-                    if now - last_time >= 5:
-                        last_pct = pct
-                        last_time = now
-                        elapsed = now - start
-                        bar = make_progress_bar(pct)
-                        eta = int((elapsed / pct) * (100 - pct)) if pct > 0 else 0
-                        ai_line = ""
-                        if info["upscaled"]:
-                            ai_line += f"🎨 Upscale: **waifu2x {info['scale']}x**\n"
-                        if info["interpolated"]:
-                            ai_line += f"🎞️ RIFE: **{settings.get('rife_mult', 2)}x** ({info['fps_in']}→{info['fps_out']} fps)\n"
-                        try:
-                            await msg.edit_text(
-                                f"🔄 **Encoding...**\n\n"
-                                f"{ai_line}"
-                                f"🖥️ T4 #{gpu_id}\n\n"
-                                f"[{bar}] **{pct}%**\n"
-                                f"⏱️ {int(elapsed//60)}m {int(elapsed%60)}s | "
-                                f"ETA {eta//60}m {eta%60}s"
-                            )
-                        except Exception:
-                            pass
+        # Use detailed progress monitor
+        final_frame, final_size = await _monitor_encode_progress(
+            process, msg, total_frames, duration, gpu_id, info, settings
+        )
 
         await process.wait()
         uid = settings.get("_uid", 0)
@@ -1020,8 +1187,17 @@ async def process_video(client, message, uid, settings):
         if has_ai:
             ok, info = await anime_encode_pipeline(input_path, out_path, settings, gpu_id, message)
         else:
-            # Direct NVENC encode (no AI)
+            # Direct NVENC encode (no AI) with detailed progress
             duration = await get_video_duration(input_path)
+            total_frames = 0
+            try:
+                val = await ffprobe(["-select_streams", "v:0", "-show_entries", "stream=nb_frames",
+                                     "-of", "default=noprint_wrappers=1:nokey=1"], input_path)
+                if val and val != "N/A":
+                    total_frames = int(val)
+            except Exception:
+                pass
+
             cmd = ["ffmpeg", "-y", "-hwaccel", "cuda", "-hwaccel_device", str(gpu_id), "-i", input_path]
             cmd.extend(["-c:v", "hevc_nvenc", "-gpu", str(gpu_id)])
             cmd.extend(["-rc", "vbr", "-cq", str(settings["crf"])])
@@ -1034,46 +1210,28 @@ async def process_video(client, message, uid, settings):
                     vf.append(f"scale={sc}")
             vf.append("format=nv12")
             cmd.extend(["-vf", ",".join(vf)])
-            cmd.extend(["-c:a", "copy", "-movflags", "+faststart", out_path])
+            cmd.extend(["-c:a", "copy", "-movflags", "+faststart"])
+            cmd.extend(["-progress", "pipe:1"])
+            cmd.append(out_path)
 
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
             active_tasks[uid] = process
 
-            last_pct = -1
-            last_t = 0
-            enc_start = time.time()
+            if message:
+                await safe_edit_text(message, f"🎬 **Starting encode...** ({total_frames} frames)")
 
-            while True:
-                line = await process.stderr.readline()
-                if not line:
-                    break
-                txt = line.decode("utf-8", errors="ignore")
-                if duration > 0:
-                    pct = parse_ffmpeg_progress(txt, duration)
-                    if pct is not None and pct != last_pct:
-                        now = time.time()
-                        if now - last_t >= 5:
-                            last_pct = pct
-                            last_t = now
-                            el = now - enc_start
-                            eta = int((el / pct) * (100 - pct)) if pct > 0 else 0
-                            try:
-                                await message.edit_text(
-                                    f"🔄 **Encoding H.265...**\n"
-                                    f"🖥️ T4 #{gpu_id}\n\n"
-                                    f"[{make_progress_bar(pct)}] **{pct}%**\n"
-                                    f"⏱️ {int(el//60)}m {int(el%60)}s | ETA {eta//60}m {eta%60}s"
-                                )
-                            except Exception:
-                                pass
+            ai_info = {"upscaled": False, "scale": 1, "interpolated": False, "fps_in": 0, "fps_out": 0}
+            final_frame, final_size = await _monitor_encode_progress(
+                process, message, total_frames, duration, gpu_id, ai_info, settings
+            )
 
             await process.wait()
             if uid in active_tasks:
                 del active_tasks[uid]
             ok = process.returncode == 0
-            info = {"upscaled": False, "scale": 1, "interpolated": False, "fps_in": 0, "fps_out": 0}
+            info = ai_info
 
         # ── Upload ─────────────────────────────────────────────────────
         if not ok or not os.path.exists(out_path):
